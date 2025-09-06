@@ -891,41 +891,28 @@ if __name__ == "__main__":
     # Set seed
     set_seed(42)
 
-    # Choose model type
-    use_moe = True  # Set to True for MoE, False for regular transformer
-
-    if use_moe:
-        # Create MoE config
-        config = MoEModelConfig(
+    # Test both models for 300 steps each
+    models_to_test = [
+        ("Regular Transformer", ModelConfig(max_steps=300)),
+        ("Mixture of Experts", MoEModelConfig(
             # Base model parameters
             d_model=384,
             n_heads=8,
             n_layers=6,
             d_ff=1536,
             batch_size=24,
-            max_steps=3000,
+            max_steps=300,
 
             # MoE specific
             num_experts=8,
             expert_top_k=2,
-            moe_layers="alternate",  # Use MoE in every other layer
+            moe_layers="alternate",
             load_balancing_weight=0.01
-        )
-        print(f"\n📋 MoE Model Configuration:")
-        print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
-        print(f"   MoE: {config.num_experts} experts, top-{config.expert_top_k} routing")
-        print(f"   MoE Layers: {config.moe_layers}")
-        print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
-        print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
-    else:
-        # Create config for regular transformer
-        config = ModelConfig()
-        print(f"\n📋 Regular Transformer Configuration:")
-        print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
-        print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
-        print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
+        ))
+    ]
 
-    # Load data
+    # Load data once (shared between models)
+    config = ModelConfig()  # Use base config for data loading
     texts, tokenizer, tokens = load_and_cache_data(config)
     dataset = TextTokenDataset(tokens, config.max_seq_len)
 
@@ -941,17 +928,37 @@ if __name__ == "__main__":
 
     print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
-    # Train model
-    start_time = time.time()
-    if use_moe:
-        model, final_metrics = train_moe_model(config, train_loader, val_loader)
-    else:
-        model, final_metrics = train_model(config, train_loader, val_loader)
-    total_time = time.time() - start_time
+    # Test both models
+    for model_name, config in models_to_test:
+        print(f"\n{'='*60}")
+        print(f"🧪 TESTING: {model_name}")
+        print(f"{'='*60}")
 
-    print(f"\n🎉 TRAINING COMPLETED!")
-    print(f"⏱️ Total time: {total_time/60:.1f} minutes")
-    print(f"🏆 Final Results:")
-    print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
-    print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
-    print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+        if isinstance(config, MoEModelConfig):
+            print(f"\n📋 MoE Model Configuration:")
+            print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
+            print(f"   MoE: {config.num_experts} experts, top-{config.expert_top_k} routing")
+            print(f"   MoE Layers: {config.moe_layers}")
+            print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
+            print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
+        else:
+            print(f"\n📋 Regular Transformer Configuration:")
+            print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
+            print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
+            print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
+
+        # Train model
+        start_time = time.time()
+        if isinstance(config, MoEModelConfig):
+            model, final_metrics = train_moe_model(config, train_loader, val_loader)
+        else:
+            model, final_metrics = train_model(config, train_loader, val_loader)
+        total_time = time.time() - start_time
+
+        print(f"\n🎯 {model_name} Results:")
+        print(f"⏱️ Training time: {total_time/60:.1f} minutes")
+        print(f"🏆 Final Results:")
+        print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
+        print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
+        print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+        print(f"{'='*60}")
