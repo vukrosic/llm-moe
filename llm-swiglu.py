@@ -226,15 +226,30 @@ class MultiHeadAttention(nn.Module):
         # attn_output = attn_output.transpose(1, 2).reshape(B, T, self.d_model)
         return self.w_o(attn_output)
 
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.linear_gate = nn.Linear(d_model, d_ff, bias=False)
+        self.linear_up = nn.Linear(d_model, d_ff, bias=False)
+
+    def forward(self, x):
+        gate = self.linear_gate(x)
+        up = self.linear_up(x)
+        swish = gate * torch.sigmoid(gate)
+        return swish * up
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
-        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
+        # For SwiGLU, we need to adjust the hidden dimension since it has gating
+        # Typically d_ff is increased by ~2/3 to maintain similar parameter count
+        swiglu_dim = int(2 * d_ff / 3)
+        self.swiglu = SwiGLU(d_model, swiglu_dim)
+        self.linear_down = nn.Linear(swiglu_dim, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.linear2(self.dropout(F.silu(self.linear1(x))))
+        return self.linear_down(self.dropout(self.swiglu(x)))
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1):
