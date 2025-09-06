@@ -975,6 +975,7 @@ if __name__ == "__main__":
     # Compare with standard model
     print(f"\n📊 Training comparison model...")
     config = ModelConfig()
+    config.vocab_size = moe_config.vocab_size  # Set vocab_size from the MoE config
     standard_model, standard_metrics = train_model(config, train_loader, val_loader)
     
     print(f"\n📈 Model Comparison:")
