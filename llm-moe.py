@@ -891,9 +891,14 @@ if __name__ == "__main__":
     # Set seed
     set_seed(42)
 
+    # Load data first to get vocab_size
+    temp_config = ModelConfig()  # Use base config for data loading
+    texts, tokenizer, tokens = load_and_cache_data(temp_config)
+    vocab_size = temp_config.vocab_size
+
     # Test both models for 300 steps each
     models_to_test = [
-        ("Regular Transformer", ModelConfig(max_steps=300)),
+        ("Regular Transformer", ModelConfig(max_steps=300, vocab_size=vocab_size)),
         ("Mixture of Experts", MoEModelConfig(
             # Base model parameters
             d_model=384,
@@ -902,6 +907,7 @@ if __name__ == "__main__":
             d_ff=1536,
             batch_size=24,
             max_steps=300,
+            vocab_size=vocab_size,
 
             # MoE specific
             num_experts=8,
@@ -911,10 +917,7 @@ if __name__ == "__main__":
         ))
     ]
 
-    # Load data once (shared between models)
-    config = ModelConfig()  # Use base config for data loading
-    texts, tokenizer, tokens = load_and_cache_data(config)
-    dataset = TextTokenDataset(tokens, config.max_seq_len)
+    dataset = TextTokenDataset(tokens, temp_config.max_seq_len)
 
     # Train/val split
     val_size = len(dataset) // 10
