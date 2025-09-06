@@ -11,7 +11,7 @@ from tqdm import tqdm
 import time
 from transformers import AutoTokenizer
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import warnings
 import os
 import pickle
@@ -63,6 +63,25 @@ class ModelConfig:
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+
+@dataclass
+class MoEModelConfig(ModelConfig):
+    """Extended ModelConfig for Mixture of Experts"""
+    # MoE specific parameters
+    num_experts: int = 8
+    expert_top_k: int = 2
+    moe_layers: str = "alternate"  # "all", "alternate", or "last_half"
+    load_balancing_weight: float = 0.01
+    
+    def should_use_moe(self, layer_idx: int) -> bool:
+        """Determine if a specific layer should use MoE"""
+        if self.moe_layers == "all":
+            return True
+        elif self.moe_layers == "alternate":
+            return layer_idx % 2 == 1  # Every other layer
+        elif self.moe_layers == "last_half":
+            return layer_idx >= self.n_layers // 2
+        return False
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -236,6 +255,145 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
 
+class Expert(nn.Module):
+    """Single expert network (essentially a FeedForward layer)"""
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
+        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        return self.linear2(self.dropout(F.silu(self.linear1(x))))
+
+class TopKRouter(nn.Module):
+    """Router that selects top-k experts for each token"""
+    def __init__(self, d_model: int, num_experts: int, top_k: int = 2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.noise_std = 0.1  # Standard deviation for noise during training
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: Input tensor [batch_size, seq_len, d_model]
+        
+        Returns:
+            - router_weights: Softmax weights for selected experts [batch_size, seq_len, top_k]
+            - expert_indices: Indices of selected experts [batch_size, seq_len, top_k]
+            - router_probs: Full probability distribution over experts (for load balancing loss)
+        """
+        batch_size, seq_len, d_model = x.shape
+        
+        # Compute router logits
+        router_logits = self.gate(x)  # [batch_size, seq_len, num_experts]
+        
+        # Add noise during training for exploration
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(router_logits) * self.noise_std
+            router_logits = router_logits + noise
+        
+        # Get full probability distribution (for load balancing loss)
+        router_probs = F.softmax(router_logits, dim=-1)
+        
+        # Select top-k experts
+        top_k_logits, top_k_indices = torch.topk(router_logits, self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)
+        
+        return top_k_weights, top_k_indices, router_probs
+
+class MixtureOfExperts(nn.Module):
+    """Mixture of Experts layer with top-k routing"""
+    def __init__(
+        self, 
+        d_model: int, 
+        d_ff: int, 
+        num_experts: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        load_balancing_weight: float = 0.01
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.load_balancing_weight = load_balancing_weight
+        
+        # Create experts
+        self.experts = nn.ModuleList([
+            Expert(d_model, d_ff, dropout) for _ in range(num_experts)
+        ])
+        
+        # Create router
+        self.router = TopKRouter(d_model, num_experts, top_k)
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            x: Input tensor [batch_size, seq_len, d_model]
+        
+        Returns:
+            - output: MoE output [batch_size, seq_len, d_model]
+            - aux_loss: Load balancing auxiliary loss (only during training)
+        """
+        batch_size, seq_len, d_model = x.shape
+        
+        # Get routing decisions
+        router_weights, expert_indices, router_probs = self.router(x)
+        
+        # Initialize output tensor
+        output = torch.zeros_like(x)
+        
+        # Process each expert
+        for expert_idx in range(self.num_experts):
+            # Find tokens routed to this expert
+            expert_mask = (expert_indices == expert_idx).any(dim=-1)  # [batch_size, seq_len]
+            
+            if expert_mask.any():
+                # Get tokens for this expert
+                expert_input = x[expert_mask]  # [num_tokens, d_model]
+                
+                # Apply expert
+                expert_output = self.experts[expert_idx](expert_input)
+                
+                # Get weights for this expert
+                expert_weights = router_weights.gather(
+                    -1, (expert_indices == expert_idx).long().argmax(dim=-1, keepdim=True)
+                )
+                expert_weights = expert_weights.squeeze(-1)[expert_mask]
+                
+                # Add weighted expert output to result
+                output[expert_mask] += expert_weights.unsqueeze(-1) * expert_output
+        
+        # Compute load balancing loss during training
+        aux_loss = None
+        if self.training:
+            aux_loss = self._compute_load_balancing_loss(router_probs, expert_indices)
+        
+        return output, aux_loss
+    
+    def _compute_load_balancing_loss(
+        self, 
+        router_probs: torch.Tensor, 
+        expert_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute auxiliary loss to ensure balanced expert usage.
+        This encourages the router to distribute tokens evenly across experts.
+        """
+        # Compute the fraction of tokens routed to each expert
+        expert_mask = F.one_hot(expert_indices, num_classes=self.num_experts).float()
+        tokens_per_expert = expert_mask.sum(dim=[0, 1, 2]) / expert_mask.sum()
+        
+        # Compute the average probability of routing to each expert
+        router_prob_mean = router_probs.mean(dim=[0, 1])
+        
+        # Load balancing loss encourages uniform distribution
+        aux_loss = torch.sum(tokens_per_expert * router_prob_mean) * self.num_experts
+        
+        return aux_loss * self.load_balancing_weight
+
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1):
         super().__init__()
@@ -251,6 +409,53 @@ class TransformerBlock(nn.Module):
         ff_out = self.feed_forward(self.norm2(x))
         x = x + self.dropout(ff_out)
         return x
+
+class MoETransformerBlock(nn.Module):
+    """Transformer block with MoE instead of standard FFN"""
+    def __init__(
+        self, 
+        d_model: int, 
+        n_heads: int, 
+        d_ff: int, 
+        max_seq_len: int,
+        num_experts: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        use_moe: bool = True
+    ):
+        super().__init__()
+        self.use_moe = use_moe
+        
+        # Attention layer
+        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
+        
+        # Feed-forward layer (either MoE or standard)
+        if use_moe:
+            self.feed_forward = MixtureOfExperts(
+                d_model, d_ff, num_experts, top_k, dropout
+            )
+        else:
+            self.feed_forward = FeedForward(d_model, d_ff, dropout)
+        
+        # Normalization layers
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # Self-attention
+        attn_out = self.attention(self.norm1(x))
+        x = x + self.dropout(attn_out)
+        
+        # Feed-forward (MoE or standard)
+        if self.use_moe:
+            ff_out, aux_loss = self.feed_forward(self.norm2(x))
+            x = x + self.dropout(ff_out)
+            return x, aux_loss
+        else:
+            ff_out = self.feed_forward(self.norm2(x))
+            x = x + self.dropout(ff_out)
+            return x, None
 
 class MinimalLLM(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -292,6 +497,75 @@ class MinimalLLM(nn.Module):
         x = self.norm(x)
         x = self.output_dropout(x)
         logits = self.lm_head(x)
+        return logits
+
+class MoEMinimalLLM(nn.Module):
+    """Minimal LLM with Mixture of Experts"""
+    def __init__(self, config: MoEModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Token embeddings
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.position_dropout = nn.Dropout(config.dropout)
+        
+        # Transformer blocks with selective MoE
+        self.transformer_blocks = nn.ModuleList([
+            MoETransformerBlock(
+                config.d_model, 
+                config.n_heads, 
+                config.d_ff, 
+                config.max_seq_len,
+                config.num_experts,
+                config.expert_top_k,
+                config.dropout,
+                use_moe=config.should_use_moe(i)
+            )
+            for i in range(config.n_layers)
+        ])
+        
+        # Output layers
+        self.norm = nn.RMSNorm(config.d_model)
+        self.output_dropout = nn.Dropout(config.dropout)
+        
+        # Language modeling head (tied with embeddings)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head.weight = self.token_embedding.weight
+        
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def forward(self, x, return_aux_loss=True):
+        # Token embeddings
+        x = self.token_embedding(x) * math.sqrt(self.config.d_model)
+        x = self.position_dropout(x)
+        
+        # Collect auxiliary losses from MoE layers
+        aux_losses = []
+        
+        # Pass through transformer blocks
+        for block in self.transformer_blocks:
+            x, aux_loss = block(x)
+            if aux_loss is not None and return_aux_loss:
+                aux_losses.append(aux_loss)
+        
+        # Output projection
+        x = self.norm(x)
+        x = self.output_dropout(x)
+        logits = self.lm_head(x)
+        
+        # Combine auxiliary losses
+        total_aux_loss = sum(aux_losses) if aux_losses else None
+        
+        if return_aux_loss:
+            return logits, total_aux_loss
         return logits
 
 def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig):
@@ -347,6 +621,172 @@ def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
     adamw_optimizer = torch.optim.AdamW(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
 
     return [muon_optimizer, adamw_optimizer]
+
+def evaluate_moe_model(model: nn.Module, val_loader: DataLoader, config: MoEModelConfig):
+    """Evaluate MoE model (without auxiliary loss)"""
+    model.eval()
+    total_loss = 0
+    total_tokens = 0
+    total_correct = 0
+    
+    device = next(model.parameters()).device
+    
+    with torch.no_grad():
+        for i, (x, y) in enumerate(val_loader):
+            if i >= config.eval_steps:
+                break
+            x, y = x.to(device), y.to(device)
+            
+            with autocast(enabled=config.use_amp):
+                logits = model(x, return_aux_loss=False)
+                loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+            
+            total_loss += loss.item() * y.numel()
+            total_tokens += y.numel()
+            
+            predictions = logits.argmax(dim=-1)
+            total_correct += (predictions == y).sum().item()
+    
+    avg_loss = total_loss / total_tokens
+    accuracy = total_correct / total_tokens
+    perplexity = math.exp(min(avg_loss, 20))
+    
+    model.train()
+    return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
+
+def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader: DataLoader):
+    """Train the MoE model"""
+    print(f"\n🚀 Training MoE model with {config.num_experts} experts (top-{config.expert_top_k})")
+    
+    # Initialize model
+    set_seed(42)
+    model = MoEMinimalLLM(config)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    active_params = sum(p.numel() for n, p in model.named_parameters() 
+                       if 'expert' not in n)
+    expert_params = total_params - active_params
+    
+    print(f"  📊 Total parameters: {total_params:,}")
+    print(f"  📊 Active parameters: {active_params:,}")
+    print(f"  📊 Expert parameters: {expert_params:,}")
+    print(f"  📊 Parameter efficiency: {active_params/total_params:.1%} active per forward pass")
+    
+    # Setup optimizers
+    optimizers = setup_muon_optimizer(model, config)
+    
+    # Learning rate schedule
+    schedulers = []
+    for optimizer in optimizers:
+        warmup_steps = config.max_steps // 20
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            else:
+                progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
+                return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        schedulers.append(scheduler)
+    
+    scaler = GradScaler() if config.use_amp else None
+    
+    # Training loop
+    model.train()
+    step = 0
+    pbar = tqdm(total=config.max_steps, desc="Training MoE")
+    
+    while step < config.max_steps:
+        for batch_idx, (x, y) in enumerate(train_loader):
+            if step >= config.max_steps:
+                break
+            
+            x, y = x.to(device), y.to(device)
+            
+            # Forward pass
+            if config.use_amp:
+                with autocast():
+                    logits, aux_loss = model(x, return_aux_loss=True)
+                    ce_loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+                    
+                    # Combine main loss and auxiliary loss
+                    total_loss = ce_loss
+                    if aux_loss is not None:
+                        total_loss = total_loss + aux_loss
+                    
+                    loss = total_loss / config.gradient_accumulation_steps
+                scaler.scale(loss).backward()
+            else:
+                logits, aux_loss = model(x, return_aux_loss=True)
+                ce_loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+                
+                total_loss = ce_loss
+                if aux_loss is not None:
+                    total_loss = total_loss + aux_loss
+                
+                loss = total_loss / config.gradient_accumulation_steps
+                loss.backward()
+            
+            # Optimizer step
+            if (step + 1) % config.gradient_accumulation_steps == 0:
+                if config.use_amp:
+                    for optimizer in optimizers:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    
+                    for optimizer in optimizers:
+                        scaler.step(optimizer)
+                        optimizer.zero_grad()
+                    for scheduler in schedulers:
+                        scheduler.step()
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    for optimizer in optimizers:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    for scheduler in schedulers:
+                        scheduler.step()
+            
+            # Logging
+            if step % 100 == 0:
+                with torch.no_grad():
+                    predictions = logits.argmax(dim=-1)
+                    accuracy = (predictions == y).float().mean().item()
+                    current_loss = ce_loss.item()
+                    perplexity = math.exp(min(current_loss, 20))
+                
+                pbar.set_postfix({
+                    'loss': f'{current_loss:.4f}',
+                    'aux': f'{aux_loss.item() if aux_loss is not None else 0:.4f}',
+                    'acc': f'{accuracy:.3f}',
+                    'ppl': f'{perplexity:.1f}'
+                })
+            
+            # Evaluation
+            if step % config.eval_every == 0 and step > 0:
+                eval_metrics = evaluate_moe_model(model, val_loader, config)
+                print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
+                      f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
+                      f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
+            
+            step += 1
+            if step % 100 == 0:
+                pbar.update(100)
+    
+    pbar.close()
+    
+    # Final evaluation
+    final_eval = evaluate_moe_model(model, val_loader, config)
+    print(f"\n📊 Final Results:")
+    print(f"   Val Loss: {final_eval['val_loss']:.4f}")
+    print(f"   Val Accuracy: {final_eval['val_accuracy']:.4f}")
+    print(f"   Val Perplexity: {final_eval['val_perplexity']:.2f}")
+    
+    return model, final_eval
 
 def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
     """Train the model with Muon optimizer"""
@@ -480,16 +920,33 @@ if __name__ == "__main__":
     # Set seed
     set_seed(42)
 
-    # Create config for Small model
-    config = ModelConfig()
-    print(f"\n📋 Model Configuration:")
-    print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
-    print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
-    print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
+    # Create config for MoE model
+    moe_config = MoEModelConfig(
+        # Base model parameters
+        d_model=384,
+        n_heads=8,
+        n_layers=6,
+        d_ff=1536,
+        batch_size=24,
+        max_steps=3000,
+        
+        # MoE specific
+        num_experts=8,
+        expert_top_k=2,
+        moe_layers="alternate",  # Use MoE in every other layer
+        load_balancing_weight=0.01
+    )
+    
+    print(f"\n📋 MoE Model Configuration:")
+    print(f"   Architecture: {moe_config.d_model}d, {moe_config.n_layers}L, {moe_config.n_heads}H, {moe_config.d_ff}ff")
+    print(f"   Experts: {moe_config.num_experts} experts, top-{moe_config.expert_top_k} routing")
+    print(f"   MoE Layers: {moe_config.moe_layers}")
+    print(f"   Training: {moe_config.max_steps} steps, batch size {moe_config.batch_size}")
+    print(f"   Data: {moe_config.max_tokens:,} tokens, seq_len {moe_config.max_seq_len}")
 
     # Load data
-    texts, tokenizer, tokens = load_and_cache_data(config)
-    dataset = TextTokenDataset(tokens, config.max_seq_len)
+    texts, tokenizer, tokens = load_and_cache_data(moe_config)
+    dataset = TextTokenDataset(tokens, moe_config.max_seq_len)
 
     # Train/val split
     val_size = len(dataset) // 10
@@ -498,19 +955,40 @@ if __name__ == "__main__":
         dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=moe_config.batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=moe_config.batch_size, shuffle=False, num_workers=2)
 
     print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
-    # Train model
+    # Train MoE model
     start_time = time.time()
-    model, final_metrics = train_model(config, train_loader, val_loader)
+    moe_model, moe_metrics = train_moe_model(moe_config, train_loader, val_loader)
     total_time = time.time() - start_time
 
-    print(f"\n🎉 TRAINING COMPLETED!")
+    print(f"\n🎉 MoE TRAINING COMPLETED!")
     print(f"⏱️ Total time: {total_time/60:.1f} minutes")
-    print(f"🏆 Final Results:")
-    print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
-    print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
-    print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+    print(f"🏆 Final MoE Results:")
+    print(f"   Validation Loss: {moe_metrics['val_loss']:.4f}")
+    print(f"   Validation Accuracy: {moe_metrics['val_accuracy']:.4f}")
+    print(f"   Validation Perplexity: {moe_metrics['val_perplexity']:.2f}")
+    
+    # Compare with standard model
+    print(f"\n📊 Training comparison model...")
+    config = ModelConfig()
+    standard_model, standard_metrics = train_model(config, train_loader, val_loader)
+    
+    print(f"\n📈 Model Comparison:")
+    print(f"   Standard Model - Loss: {standard_metrics['val_loss']:.4f}, "
+          f"Acc: {standard_metrics['val_accuracy']:.4f}, PPL: {standard_metrics['val_perplexity']:.2f}")
+    print(f"   MoE Model      - Loss: {moe_metrics['val_loss']:.4f}, "
+          f"Acc: {moe_metrics['val_accuracy']:.4f}, PPL: {moe_metrics['val_perplexity']:.2f}")
+    
+    # Parameter comparison
+    standard_params = sum(p.numel() for p in standard_model.parameters())
+    moe_total_params = sum(p.numel() for p in moe_model.parameters())
+    moe_active_params = sum(p.numel() for n, p in moe_model.named_parameters() if 'expert' not in n)
+    
+    print(f"\n🔢 Parameter Comparison:")
+    print(f"   Standard Model: {standard_params:,} parameters")
+    print(f"   MoE Model: {moe_total_params:,} total, {moe_active_params:,} active per forward pass")
+    print(f"   MoE Efficiency: {moe_active_params/moe_total_params:.1%} active parameters")
