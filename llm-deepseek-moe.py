@@ -116,7 +116,8 @@ class Muon(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
 
-                g = p.grad
+                # Ensure gradient is in float32 for compatibility with AMP
+                g = p.grad.float() if p.grad.dtype == torch.bfloat16 else p.grad
                 state = self.state[p]
 
                 if "momentum_buffer" not in state:
@@ -126,6 +127,10 @@ class Muon(torch.optim.Optimizer):
                 buf.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                
+                # Convert back to parameter dtype before update
+                if p.dtype != g.dtype:
+                    g = g.to(p.dtype)
                 p.add_(g.view_as(p), alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
 	
 def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache"):
@@ -429,13 +434,24 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             # Optimizer step after accumulation
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 if config.use_amp:
-                    for optimizer in optimizers:
-                        scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-
-                    for optimizer in optimizers:
-                        scaler.step(optimizer)
-                        optimizer.zero_grad()
+                    # Handle Muon optimizer (first) differently from AdamW
+                    # Muon doesn't work well with scaler.unscale_() due to BFloat16 issues
+                    muon_optimizer = optimizers[0]  # Muon is first
+                    adamw_optimizer = optimizers[1]  # AdamW is second
+                    
+                    # For Muon: step directly without scaler.unscale_
+                    scaler.step(muon_optimizer)
+                    muon_optimizer.zero_grad()
+                    
+                    # For AdamW: use normal AMP flow
+                    scaler.unscale_(adamw_optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p in adamw_optimizer.param_groups[0]['params']], 
+                        config.grad_clip
+                    )
+                    scaler.step(adamw_optimizer)
+                    adamw_optimizer.zero_grad()
+                    
                     for scheduler in schedulers:
                         scheduler.step()
                     scaler.update()
