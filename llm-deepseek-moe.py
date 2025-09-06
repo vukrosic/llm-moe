@@ -332,7 +332,8 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
                 break
             x, y = x.to(device), y.to(device)
 
-            with autocast(enabled=config.use_amp):
+            # Force fp16 autocast to avoid bf16 scaler path
+            with autocast(enabled=config.use_amp, dtype=torch.float16):
                 logits = model(x)
                 loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
 
@@ -420,7 +421,8 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
             # Forward pass with gradient accumulation
             if config.use_amp:
-                with autocast():
+                # Force fp16 autocast to avoid bf16 scaler path
+                with autocast(dtype=torch.float16):
                     logits = model(x)
                     loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
                     loss = loss / config.gradient_accumulation_steps
@@ -434,24 +436,14 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             # Optimizer step after accumulation
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 if config.use_amp:
-                    # Handle Muon optimizer (first) differently from AdamW
-                    # Muon doesn't work well with scaler.unscale_() due to BFloat16 issues
-                    muon_optimizer = optimizers[0]  # Muon is first
-                    adamw_optimizer = optimizers[1]  # AdamW is second
-                    
-                    # For Muon: step directly without scaler.unscale_
-                    scaler.step(muon_optimizer)
-                    muon_optimizer.zero_grad()
-                    
-                    # For AdamW: use normal AMP flow
-                    scaler.unscale_(adamw_optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p in adamw_optimizer.param_groups[0]['params']], 
-                        config.grad_clip
-                    )
-                    scaler.step(adamw_optimizer)
-                    adamw_optimizer.zero_grad()
-                    
+                    # Standard AMP flow on both optimizers now that we force fp16
+                    for optimizer in optimizers:
+                        scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+
+                    for optimizer in optimizers:
+                        scaler.step(optimizer)
+                        optimizer.zero_grad()
                     for scheduler in schedulers:
                         scheduler.step()
                     scaler.update()
