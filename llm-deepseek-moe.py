@@ -11,11 +11,15 @@ from tqdm import tqdm
 import time
 from transformers import AutoTokenizer
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import warnings
 import os
 import pickle
 from torchtune.modules import RotaryPositionalEmbeddings
+
+# Import MoE components from DeepSeek V3
+from deepseek_v3_model import Gate, Expert, MoE
+
 warnings.filterwarnings('ignore')
 
 def set_seed(seed: int = 42):
@@ -36,7 +40,18 @@ class ModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 3000
+    max_steps: int = 500
+
+    # MoE parameters (matching DeepSeek v3 ModelArgs)
+    dim: int = 384  # Same as d_model
+    n_routed_experts: int = 8
+    n_shared_experts: int = 2
+    n_activated_experts: int = 2
+    n_expert_groups: int = 1
+    n_limited_groups: int = 1
+    score_func: str = "softmax"
+    route_scale: float = 1.0
+    moe_inter_dim: int = 512
 
     # Training parameters
     gradient_accumulation_steps: int = 4
@@ -62,6 +77,7 @@ class ModelConfig:
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
+        self.dim = self.d_model  # Ensure dim matches d_model for DeepSeek MoE
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
 
 @torch.compile
@@ -236,13 +252,14 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
 
+
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1):
+    def __init__(self, config: ModelConfig, max_seq_len: int, dropout: float = 0.1):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
-        self.feed_forward = FeedForward(d_model, d_ff, dropout)
-        self.norm1 = nn.RMSNorm(d_model)
-        self.norm2 = nn.RMSNorm(d_model)
+        self.attention = MultiHeadAttention(config.d_model, config.n_heads, max_seq_len, dropout)
+        self.feed_forward = MoE(config)
+        self.norm1 = nn.RMSNorm(config.d_model)
+        self.norm2 = nn.RMSNorm(config.d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -261,7 +278,7 @@ class MinimalLLM(nn.Module):
         self.position_dropout = nn.Dropout(config.dropout)
 
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout)
+            TransformerBlock(config, config.max_seq_len, config.dropout)
             for _ in range(config.n_layers)
         ])
 
