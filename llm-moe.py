@@ -896,9 +896,9 @@ if __name__ == "__main__":
     texts, tokenizer, tokens = load_and_cache_data(temp_config)
     vocab_size = temp_config.vocab_size
 
-    # Test both models for 300 steps each
+    # Test both models for 3000 steps each
     models_to_test = [
-        ("Regular Transformer", ModelConfig(max_steps=300, vocab_size=vocab_size)),
+        ("Regular Transformer", ModelConfig(max_steps=3000, vocab_size=vocab_size)),
         ("Mixture of Experts", MoEModelConfig(
             # Base model parameters
             d_model=384,
@@ -906,7 +906,7 @@ if __name__ == "__main__":
             n_layers=6,
             d_ff=1536,
             batch_size=24,
-            max_steps=300,
+            max_steps=3000,
             vocab_size=vocab_size,
 
             # MoE specific
