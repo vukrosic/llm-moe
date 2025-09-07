@@ -388,21 +388,17 @@ class MixtureOfExperts(nn.Module):
         expert_weights_flat = final_expert_weights.view(-1, self.num_experts)
         # Shape: [batch_size * seq_len, num_experts]
         
-        # Process ALL experts in parallel using batched operations
-        # First layer: [batch*seq, d_model] @ [num_experts, d_model, d_ff] -> [batch*seq, num_experts, d_ff]
-        x_expanded = x_reshaped.unsqueeze(1).expand(-1, self.num_experts, -1)
-        # Shape: [batch*seq, num_experts, d_model]
-        
-        # Batched matrix multiplication for first layer
-        hidden = torch.bmm(x_expanded, self.expert_w1)
+        # Process ALL experts in parallel using einsum operations
+        # First layer: [batch*seq, d_model] x [num_experts, d_model, d_ff] -> [batch*seq, num_experts, d_ff]
+        hidden = torch.einsum('bd,edf->bef', x_reshaped, self.expert_w1)
         # Shape: [batch*seq, num_experts, d_ff]
         
         # Apply activation and dropout
         hidden = F.silu(hidden)
         hidden = self.dropout(hidden)
         
-        # Second layer: [batch*seq, num_experts, d_ff] @ [num_experts, d_ff, d_model] -> [batch*seq, num_experts, d_model]
-        expert_outputs = torch.bmm(hidden, self.expert_w2)
+        # Second layer: [batch*seq, num_experts, d_ff] x [num_experts, d_ff, d_model] -> [batch*seq, num_experts, d_model]
+        expert_outputs = torch.einsum('bef,efd->bed', hidden, self.expert_w2)
         # Shape: [batch*seq, num_experts, d_model]
         
         # Weight and sum expert outputs
