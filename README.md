@@ -4,14 +4,15 @@
 
 This repository implements and compares two transformer architectures for language modeling. The `llm-same-flops-data.py` file contains both standard Feed-Forward (FF) and Mixture of Experts (MoE) implementations with **fair FLOP-based comparison**.
 
-## 📊 Latest Results Summary (Fair FLOP Comparison) - Model is small, so regular FF works better
+## 📊 Latest Results Summary (Fair FLOP Comparison)
+##### Model is small, so regular FF works better (any ideas on making MoE better?)
 
 | Model | Parameters | Active Params | Param Utilization | Val Loss | Val Acc | Val PPL | Training Time | Total FLOPs |
 |-------|------------|---------------|------------------|----------|---------|---------|---------------|-------------|
 | Regular Transformer | ~29M | 29M | 100% | **0.4018** | **0.9289** | **1.49** | 1.5 min | 8e14 |
 | MoE (8 experts, top-2) | ~54M | ~25M | **47.8%** | 0.4639 | 0.9164 | 1.59 | 2.2 min | 8e14 |
 
-> **Key Finding**: With longer training and equal FLOP budgets, the regular transformer achieved better final performance despite MoE's parameter efficiency advantage.
+> **Key Finding**: With equal FLOP budgets, the regular transformer achieved better final performance despite MoE's parameter efficiency advantage.
 
 ## 🚀 Features
 
