@@ -59,6 +59,7 @@ class ModelConfig:
     # Technical
     use_amp: bool = True
     vocab_size: Optional[int] = None
+    log_milestones: Tuple[int, ...] = (2000, 5000, 10000)
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
@@ -735,6 +736,11 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
 
+            # Milestone evaluations
+            if step in getattr(config, 'log_milestones', ()):    
+                eval_metrics = evaluate_model(model, val_loader, config)
+                print(f"\n🧪 Milestone {step}: Val Loss: {eval_metrics['val_loss']:.4f}")
+
             step += 1
             if step % 100 == 0:
                 pbar.update(100)
@@ -870,6 +876,11 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
                       f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
                       f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
 
+            # Milestone evaluations
+            if step in getattr(config, 'log_milestones', ()):    
+                eval_metrics = evaluate_model(model, val_loader, config)
+                print(f"\n🧪 Milestone {step}: Val Loss: {eval_metrics['val_loss']:.4f}")
+
             step += 1
             if step % 100 == 0:
                 pbar.update(100)
@@ -900,9 +911,13 @@ if __name__ == "__main__":
     texts, tokenizer, tokens = load_and_cache_data(temp_config)
     vocab_size = temp_config.vocab_size
 
-    # Test both models for 3000 steps each
+    # Test both models for 10k steps with milestone evals
     models_to_test = [
-        # ("Regular Transformer", ModelConfig(max_steps=3000, vocab_size=vocab_size)),
+        ("Regular Transformer", ModelConfig(
+            max_steps=10000,
+            eval_every=10000000,
+            vocab_size=vocab_size
+        )),
         ("Mixture of Experts", MoEModelConfig(
             # Base model parameters
             d_model=384,
@@ -910,7 +925,8 @@ if __name__ == "__main__":
             n_layers=6,
             d_ff=1536,
             batch_size=24,
-            max_steps=5000,
+            max_steps=10000,
+            eval_every=10000000,
             vocab_size=vocab_size,
 
             # MoE specific
