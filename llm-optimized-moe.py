@@ -321,7 +321,7 @@ class TopKRouter(nn.Module):
         return top_k_weights, top_k_indices, router_probs
 
 class MixtureOfExperts(nn.Module):
-    """Optimized Mixture of Experts layer with vectorized operations"""
+    """Fully vectorized Mixture of Experts layer using batched operations"""
     def __init__(
         self,
         d_model: int,
@@ -335,77 +335,92 @@ class MixtureOfExperts(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.load_balancing_weight = load_balancing_weight
-
-        # Create experts as a ModuleList (can be compiled individually)
-        self.experts = nn.ModuleList([
-            Expert(d_model, d_ff, dropout) for _ in range(num_experts)
-        ])
-
+        self.d_model = d_model
+        self.d_ff = d_ff
+        
+        # Stack all expert weights for complete vectorization
+        # This allows us to process ALL experts in parallel with batched matrix operations
+        self.expert_w1 = nn.Parameter(torch.empty(num_experts, d_model, d_ff))
+        self.expert_w2 = nn.Parameter(torch.empty(num_experts, d_ff, d_model))
+        
+        # Initialize weights using same strategy as individual experts
+        for i in range(num_experts):
+            nn.init.normal_(self.expert_w1[i], mean=0.0, std=0.02)
+            nn.init.normal_(self.expert_w2[i], mean=0.0, std=0.02)
+        
+        self.dropout = nn.Dropout(dropout)
         self.router = TopKRouter(d_model, num_experts, top_k)
-
-    @torch.compile  # Compile this method for better performance
-    def parallel_experts_forward(self, x: torch.Tensor, expert_indices: torch.Tensor,
-                                router_weights: torch.Tensor) -> torch.Tensor:
-        """Process tokens through experts in parallel using advanced indexing"""
-        batch_size, seq_len, d_model = x.shape
-        batch_size_times_seq_len = batch_size * seq_len
-
-        # Flatten inputs
-        x_flat = x.view(batch_size_times_seq_len, d_model)
-        expert_indices_flat = expert_indices.view(batch_size_times_seq_len, self.top_k)
-        router_weights_flat = router_weights.view(batch_size_times_seq_len, self.top_k)
-
-        # Prepare tensors for scatter operation
-        output = torch.zeros(batch_size_times_seq_len, d_model,
-                           device=x.device, dtype=x.dtype)
-
-        # Process each expert in parallel using vectorized operations
-        for k in range(self.top_k):
-            # Get indices for this position
-            expert_idx_k = expert_indices_flat[:, k]  # [B*S]
-            weights_k = router_weights_flat[:, k]  # [B*S]
-
-            # Group tokens by expert
-            for expert_id in range(self.num_experts):
-                # Find tokens assigned to this expert
-                mask = (expert_idx_k == expert_id)
-                if not mask.any():
-                    continue
-
-                # Get tokens for this expert
-                expert_input = x_flat[mask]
-
-                # Apply expert (this can be parallelized across experts)
-                with torch.cuda.amp.autocast(enabled=False):  # Experts might work better in fp32
-                    expert_output = self.experts[expert_id](expert_input)
-
-                # Add weighted output
-                output[mask] += weights_k[mask].unsqueeze(-1) * expert_output
-
-        return output.view(batch_size, seq_len, d_model)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Optimized forward pass using vectorized operations
-
+        Fully vectorized forward pass using only batched operations
+        
         Args:
             x: Input tensor [batch_size, seq_len, d_model]
-
+        
         Returns:
-            - output: MoE output [batch_size, seq_len, d_model]
+            - output: MoE output [batch_size, seq_len, d_model]  
             - aux_loss: Load balancing auxiliary loss (only during training)
         """
+        batch_size, seq_len, d_model = x.shape
+        
         # Get routing decisions
         router_weights, expert_indices, router_probs = self.router(x)
-
-        # Process through experts using optimized parallel method
-        output = self.parallel_experts_forward(x, expert_indices, router_weights)
-
+        # router_weights: [batch_size, seq_len, top_k]
+        # expert_indices: [batch_size, seq_len, top_k]
+        
+        # Reshape for batched processing
+        x_reshaped = x.view(-1, d_model)  # [batch_size * seq_len, d_model]
+        
+        # Convert to one-hot encoding for expert selection
+        expert_one_hot = F.one_hot(expert_indices, num_classes=self.num_experts).float()
+        # Shape: [batch_size, seq_len, top_k, num_experts]
+        
+        # Combine with routing weights
+        expert_weights = router_weights.unsqueeze(-1) * expert_one_hot
+        # Shape: [batch_size, seq_len, top_k, num_experts]
+        
+        # Sum across top_k to get final expert weights per token
+        final_expert_weights = expert_weights.sum(dim=2)
+        # Shape: [batch_size, seq_len, num_experts]
+        
+        # Reshape for batch processing
+        expert_weights_flat = final_expert_weights.view(-1, self.num_experts)
+        # Shape: [batch_size * seq_len, num_experts]
+        
+        # Process ALL experts in parallel using batched operations
+        # First layer: [batch*seq, d_model] @ [num_experts, d_model, d_ff] -> [batch*seq, num_experts, d_ff]
+        x_expanded = x_reshaped.unsqueeze(1).expand(-1, self.num_experts, -1)
+        # Shape: [batch*seq, num_experts, d_model]
+        
+        # Batched matrix multiplication for first layer
+        hidden = torch.bmm(x_expanded, self.expert_w1)
+        # Shape: [batch*seq, num_experts, d_ff]
+        
+        # Apply activation and dropout
+        hidden = F.silu(hidden)
+        hidden = self.dropout(hidden)
+        
+        # Second layer: [batch*seq, num_experts, d_ff] @ [num_experts, d_ff, d_model] -> [batch*seq, num_experts, d_model]
+        expert_outputs = torch.bmm(hidden, self.expert_w2)
+        # Shape: [batch*seq, num_experts, d_model]
+        
+        # Weight and sum expert outputs
+        weighted_outputs = expert_outputs * expert_weights_flat.unsqueeze(-1)
+        # Shape: [batch*seq, num_experts, d_model]
+        
+        # Sum across experts
+        output_flat = weighted_outputs.sum(dim=1)
+        # Shape: [batch*seq, d_model]
+        
+        # Reshape back to original dimensions
+        output = output_flat.view(batch_size, seq_len, d_model)
+        
         # Compute load balancing loss during training
         aux_loss = None
         if self.training:
             aux_loss = self._compute_load_balancing_loss(router_probs, expert_indices)
-
+        
         return output, aux_loss
 
     def _compute_load_balancing_loss(
@@ -413,19 +428,17 @@ class MixtureOfExperts(nn.Module):
         router_probs: torch.Tensor,
         expert_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Compute auxiliary loss for load balancing"""
-        # One-hot encode expert assignments
+        """Optimized load balancing loss computation"""
+        # Compute the fraction of tokens routed to each expert (vectorized)
         expert_mask = F.one_hot(expert_indices, num_classes=self.num_experts).float()
-
-        # Fraction of tokens per expert
-        tokens_per_expert = expert_mask.mean(dim=(0, 1, 2))
-
-        # Average routing probability per expert
+        tokens_per_expert = expert_mask.sum(dim=(0, 1, 2)) / expert_mask.sum()
+        
+        # Compute the average probability of routing to each expert
         router_prob_mean = router_probs.mean(dim=(0, 1))
-
-        # Compute loss (encourages uniform distribution)
-        aux_loss = torch.sum(tokens_per_expert * router_prob_mean) * self.num_experts
-
+        
+        # Load balancing loss
+        aux_loss = (tokens_per_expert * router_prob_mean).sum() * self.num_experts
+        
         return aux_loss * self.load_balancing_weight
 
 class MoETransformerBlock(nn.Module):
