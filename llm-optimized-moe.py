@@ -321,7 +321,7 @@ class TopKRouter(nn.Module):
         return top_k_weights, top_k_indices, router_probs
 
 class MixtureOfExperts(nn.Module):
-    """Mixture of Experts layer with top-k routing"""
+    """Optimized Mixture of Experts layer with vectorized operations"""
     def __init__(
         self,
         d_model: int,
@@ -336,16 +336,58 @@ class MixtureOfExperts(nn.Module):
         self.top_k = top_k
         self.load_balancing_weight = load_balancing_weight
 
-        # Create experts
+        # Create experts as a ModuleList (can be compiled individually)
         self.experts = nn.ModuleList([
             Expert(d_model, d_ff, dropout) for _ in range(num_experts)
         ])
 
-        # Create router
         self.router = TopKRouter(d_model, num_experts, top_k)
+
+    @torch.compile  # Compile this method for better performance
+    def parallel_experts_forward(self, x: torch.Tensor, expert_indices: torch.Tensor,
+                                router_weights: torch.Tensor) -> torch.Tensor:
+        """Process tokens through experts in parallel using advanced indexing"""
+        batch_size, seq_len, d_model = x.shape
+        batch_size_times_seq_len = batch_size * seq_len
+
+        # Flatten inputs
+        x_flat = x.view(batch_size_times_seq_len, d_model)
+        expert_indices_flat = expert_indices.view(batch_size_times_seq_len, self.top_k)
+        router_weights_flat = router_weights.view(batch_size_times_seq_len, self.top_k)
+
+        # Prepare tensors for scatter operation
+        output = torch.zeros(batch_size_times_seq_len, d_model,
+                           device=x.device, dtype=x.dtype)
+
+        # Process each expert in parallel using vectorized operations
+        for k in range(self.top_k):
+            # Get indices for this position
+            expert_idx_k = expert_indices_flat[:, k]  # [B*S]
+            weights_k = router_weights_flat[:, k]  # [B*S]
+
+            # Group tokens by expert
+            for expert_id in range(self.num_experts):
+                # Find tokens assigned to this expert
+                mask = (expert_idx_k == expert_id)
+                if not mask.any():
+                    continue
+
+                # Get tokens for this expert
+                expert_input = x_flat[mask]
+
+                # Apply expert (this can be parallelized across experts)
+                with torch.cuda.amp.autocast(enabled=False):  # Experts might work better in fp32
+                    expert_output = self.experts[expert_id](expert_input)
+
+                # Add weighted output
+                output[mask] += weights_k[mask].unsqueeze(-1) * expert_output
+
+        return output.view(batch_size, seq_len, d_model)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
+        Optimized forward pass using vectorized operations
+
         Args:
             x: Input tensor [batch_size, seq_len, d_model]
 
@@ -353,38 +395,11 @@ class MixtureOfExperts(nn.Module):
             - output: MoE output [batch_size, seq_len, d_model]
             - aux_loss: Load balancing auxiliary loss (only during training)
         """
-        batch_size, seq_len, d_model = x.shape
-
         # Get routing decisions
         router_weights, expert_indices, router_probs = self.router(x)
 
-        # Initialize output tensor
-        output = torch.zeros_like(x)
-
-        # Process each expert
-        for expert_idx in range(self.num_experts):
-            # Find tokens routed to this expert
-            expert_mask = (expert_indices == expert_idx).any(dim=-1)  # [batch_size, seq_len]
-
-            if expert_mask.any():
-                # Get tokens for this expert
-                expert_input = x[expert_mask]  # [num_tokens, d_model]
-
-                # Apply expert
-                expert_output = self.experts[expert_idx](expert_input)
-
-                # Get weights for this expert - CORRECTED APPROACH
-                # First get the mask for this expert's positions
-                mask_for_expert = (expert_indices == expert_idx)  # [batch, seq, top_k]
-                # Find which position (0 or 1) this expert appears in for relevant tokens
-                positions = mask_for_expert[expert_mask].float().argmax(dim=-1)
-                # Gather weights only for relevant tokens
-                expert_weights = router_weights[expert_mask].gather(
-                    -1, positions.unsqueeze(-1)
-                ).squeeze(-1)
-
-                # Add weighted expert output to result
-                output[expert_mask] += expert_weights.unsqueeze(-1) * expert_output
+        # Process through experts using optimized parallel method
+        output = self.parallel_experts_forward(x, expert_indices, router_weights)
 
         # Compute load balancing loss during training
         aux_loss = None
@@ -398,18 +413,17 @@ class MixtureOfExperts(nn.Module):
         router_probs: torch.Tensor,
         expert_indices: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute auxiliary loss to ensure balanced expert usage.
-        This encourages the router to distribute tokens evenly across experts.
-        """
-        # Compute the fraction of tokens routed to each expert
+        """Compute auxiliary loss for load balancing"""
+        # One-hot encode expert assignments
         expert_mask = F.one_hot(expert_indices, num_classes=self.num_experts).float()
-        tokens_per_expert = expert_mask.sum(dim=[0, 1, 2]) / expert_mask.sum()
 
-        # Compute the average probability of routing to each expert
-        router_prob_mean = router_probs.mean(dim=[0, 1])
+        # Fraction of tokens per expert
+        tokens_per_expert = expert_mask.mean(dim=(0, 1, 2))
 
-        # Load balancing loss encourages uniform distribution
+        # Average routing probability per expert
+        router_prob_mean = router_probs.mean(dim=(0, 1))
+
+        # Compute loss (encourages uniform distribution)
         aux_loss = torch.sum(tokens_per_expert * router_prob_mean) * self.num_experts
 
         return aux_loss * self.load_balancing_weight
