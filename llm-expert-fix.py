@@ -372,11 +372,15 @@ class MixtureOfExperts(nn.Module):
                 # Apply expert
                 expert_output = self.experts[expert_idx](expert_input)
 
-                # Get weights for this expert
-                expert_weights = router_weights.gather(
-                    -1, (expert_indices == expert_idx).long().argmax(dim=-1, keepdim=True)
-                )
-                expert_weights = expert_weights.squeeze(-1)[expert_mask]
+                # Get weights for this expert - CORRECTED APPROACH
+                # First get the mask for this expert's positions
+                mask_for_expert = (expert_indices == expert_idx)  # [batch, seq, top_k]
+                # Find which position (0 or 1) this expert appears in for relevant tokens
+                positions = mask_for_expert[expert_mask].float().argmax(dim=-1)
+                # Gather weights only for relevant tokens
+                expert_weights = router_weights[expert_mask].gather(
+                    -1, positions.unsqueeze(-1)
+                ).squeeze(-1)
 
                 # Add weighted expert output to result
                 output[expert_mask] += expert_weights.unsqueeze(-1) * expert_output
@@ -898,7 +902,7 @@ if __name__ == "__main__":
 
     # Test both models for 3000 steps each
     models_to_test = [
-        ("Regular Transformer", ModelConfig(max_steps=3000, vocab_size=vocab_size)),
+        # ("Regular Transformer", ModelConfig(max_steps=3000, vocab_size=vocab_size)),
         ("Mixture of Experts", MoEModelConfig(
             # Base model parameters
             d_model=384,
@@ -906,7 +910,7 @@ if __name__ == "__main__":
             n_layers=6,
             d_ff=1536,
             batch_size=24,
-            max_steps=3000,
+            max_steps=1500,
             vocab_size=vocab_size,
 
             # MoE specific
