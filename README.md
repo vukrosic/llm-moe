@@ -5,7 +5,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/vukrosic/llm-moe?style=social)](https://github.com/vukrosic/llm-moe/stargazers)
 [![GitHub Issues](https://img.shields.io/github/issues/vukrosic/llm-moe)](https://github.com/vukrosic/llm-moe/issues)
 
-[![LLM Research: Research MoE LLMs](./public/splace-holder.png)](https://github.com/vukrosic/llm-moe)
+[![LLM Research: Research MoE LLMs](./public/place-holder.png)](https://github.com/vukrosic/llm-moe)
 
 **🔍 Looking for bugs and improvements in the MoE implementation!** Please review the code and suggest fixes or enhancements.
 
