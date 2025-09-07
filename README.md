@@ -138,6 +138,9 @@ This repository implements and compares two transformer architectures for langua
   - `model.py`: Model architectures (Transformer + MoE)
   - `train.py`: Data loading/cache, dataset, training loops, Muon optimizer, FLOPs calc, saving/logging
   - `main.py`: Entry point for training/experiments (fair FLOP comparison)
+- `docker/`
+  - `Dockerfile`: Defines the container image (PyTorch + dependencies)
+  - `docker-compose.yml`: Compose configuration for running and managing containers
 - `monitor.py`: GPU utilization monitor (root-level CLI)
 - `outputs/`: final models saved here (git-ignored except `.gitkeep`)
 - `checkpoints/`: periodic checkpoints saved here (git-ignored except `.gitkeep`)
@@ -182,3 +185,40 @@ This repo uses a `src/` layout. Use `-m` to run the main script:
 ```bash
 python -m src.main
 ```
+---
+
+## 🐳 Running with Docker
+
+This project includes a **Dockerfile** and **docker-compose.yml** to simplify setup and ensure a consistent environment.
+
+### Build the image
+
+```bash
+docker-compose build
+```
+
+### Run training inside a container
+
+```bash
+docker-compose up
+```
+
+This will:
+
+* Mount local directories for **checkpoints**, **logs**, and **outputs** (so your results persist outside the container).
+* Expose GPU resources if available (`runtime: nvidia`).
+* Increase shared memory (`shm_size: 16g`) to support larger batch sizes without CUDA errors.
+
+### Example: run main training loop
+
+```bash
+docker-compose run --rm llm-moe python src/main.py
+```
+
+### Example: monitor GPU utilization
+
+```bash
+docker-compose run --rm llm-moe python src/monitor.py
+```
+
+> 💡 Tip: If you want to customize configs (e.g., learning rate, model size), pass arguments into `src/main.py` as you normally would.
