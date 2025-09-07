@@ -1,8 +1,15 @@
 # LLM Research: Transformer vs Mixture of Experts
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](requirements.txt)
+[![GitHub Stars](https://img.shields.io/github/stars/vukrosic/llm-moe?style=social)](https://github.com/vukrosic/llm-moe/stargazers)
+[![GitHub Issues](https://img.shields.io/github/issues/vukrosic/llm-moe)](https://github.com/vukrosic/llm-moe/issues)
+
+[![LLM Research: Research MoE LLMs](./public/place-holder.png)](https://github.com/vukrosic/llm-moe)
+
 **🔍 Looking for bugs and improvements in the MoE implementation!** Please review the code and suggest fixes or enhancements.
 
-This repository implements and compares two transformer architectures for language modeling. The `llm-same-flops-data.py` file contains both standard Feed-Forward (FF) and Mixture of Experts (MoE) implementations with **fair FLOP-based comparison**.
+This repository implements and compares two transformer architectures for language modeling.
 
 ## 📊 Latest Results Summary (Fair FLOP Comparison)
 ##### Model is small, so regular FF works better (any ideas on making MoE better?)
@@ -99,31 +106,6 @@ This repository implements and compares two transformer architectures for langua
 - **Architecture Choice**: Depends on training budget, data scale, and computational constraints
 - **Further Research Needed**: Test with larger datasets, different expert counts, improved routing
 
-## 🛠️ Usage
-
-### Main Fair Comparison Script (Recommended)
-```bash
-python llm-same-flops-data.py
-```
-
-**Features**:
-- ✅ **Fair FLOP-based comparison** - both models use identical computational budgets
-- ✅ **Automatic step calculation** - adjusts training steps to equalize FLOPs
-- ✅ **Comprehensive evaluation** - validation at milestones and final results
-- ✅ **Detailed reporting** - FLOPs per second, parameter efficiency metrics
-
-**What it does**:
-1. Downloads and caches tokenized data from SmolLM corpus
-2. Calculates fair training steps based on model FLOPs
-3. Trains both models with equal total computational budget
-4. Reports detailed performance metrics and efficiency comparisons
-
-### Legacy Script
-```bash
-python llm.py
-```
-Original implementation with fixed training steps (not FLOP-equalized).
-
 ## 🔬 Future Research Directions
 
 - **Scale Testing**: Evaluate with larger datasets (10M+ tokens) where MoE benefits may emerge
@@ -149,9 +131,94 @@ Original implementation with fixed training steps (not FLOP-equalized).
 - Datasets (HuggingFace)
 - tqdm, numpy
 
-## 📄 Files
+## 📁 Project Structure 
 
-- `llm-same-flops-data.py`: Main fair comparison script with FLOP-equalized training
-- `llm.py`: Legacy implementation with fixed training steps
-- `gpu_monitor.py`: GPU monitoring utilities
+- `src/`
+  - `config.py`: Central configuration dataclasses and `set_seed`
+  - `model.py`: Model architectures (Transformer + MoE)
+  - `train.py`: Data loading/cache, dataset, training loops, Muon optimizer, FLOPs calc, saving/logging
+  - `main.py`: Entry point for training/experiments (fair FLOP comparison)
+- `docker/`
+  - `Dockerfile`: Defines the container image (PyTorch + dependencies)
+  - `docker-compose.yml`: Compose configuration for running and managing containers
+- `monitor.py`: GPU utilization monitor (root-level CLI)
+- `outputs/`: final models saved here (git-ignored except `.gitkeep`)
+- `checkpoints/`: periodic checkpoints saved here (git-ignored except `.gitkeep`)
+- `logs/`: JSONL training logs and run metrics (git-ignored except `.gitkeep`)
+- `.gitignore`: ensures only `.gitkeep` is tracked inside the above artifact folders
 - `requirements.txt`: Python dependencies
+
+## 🧭 Usage
+
+- Run the main training/comparison script:
+```bash
+python -m src.main
+```
+
+- Run the GPU utilization monitor (in a separate terminal):
+```bash
+python gpu_monitor.py
+```
+
+### Optional: HellaSwag evaluation during training
+- Enable periodic HellaSwag evaluation by setting these in `config.ModelConfig`:
+  - `hellaswag_eval_every`: evaluation interval in steps (e.g., 500)
+  - `hellaswag_max_samples`: max samples to score per eval (default 1000)
+  - `hellaswag_split`: dataset split to use (default `validation`)
+
+When enabled, training prints lines like:
+```
+📚 HellaSwag@1500: acc=0.742 on 1000 samples
+```
+
+## 💾 Checkpoints, Outputs, Logs
+
+- Checkpoints: saved periodically to `checkpoints/ckpt_step_XXXX.pt` (on eval intervals)
+- Final models: saved to `outputs/final_standard.pt` and `outputs/final_moe.pt`
+- Logs: JSONL appended to `logs/train.jsonl` with events like `eval`, `checkpoint`, `final`
+
+The directories `outputs/`, `checkpoints/`, and `logs/` are git-ignored except for their `.gitkeep` files, so artifacts are not committed.
+
+## ▶️ Running as a module
+
+This repo uses a `src/` layout. Use `-m` to run the main script:
+```bash
+python -m src.main
+```
+---
+
+## 🐳 Running with Docker
+
+This project includes a **Dockerfile** and **docker-compose.yml** to simplify setup and ensure a consistent environment.
+
+### Build the image
+
+```bash
+docker-compose build
+```
+
+### Run training inside a container
+
+```bash
+docker-compose up
+```
+
+This will:
+
+* Mount local directories for **checkpoints**, **logs**, and **outputs** (so your results persist outside the container).
+* Expose GPU resources if available (`runtime: nvidia`).
+* Increase shared memory (`shm_size: 16g`) to support larger batch sizes without CUDA errors.
+
+### Example: run main training loop
+
+```bash
+docker-compose run --rm llm-moe python src/main.py
+```
+
+### Example: monitor GPU utilization
+
+```bash
+docker-compose run --rm llm-moe python src/monitor.py
+```
+
+> 💡 Tip: If you want to customize configs (e.g., learning rate, model size), pass arguments into `src/main.py` as you normally would.
