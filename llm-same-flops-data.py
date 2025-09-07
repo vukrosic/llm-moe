@@ -997,7 +997,7 @@ if __name__ == "__main__":
     print(f"   FLOP ratio (MoE/Standard): {moe_flops/standard_flops:.2f}x")
     
     # Equalize training by FLOPs - use a target total FLOPs
-    target_total_flops = 1e12  # 1 trillion FLOPs total
+    target_total_flops = 8e14  # 800 trillion FLOPs total for longer training
     standard_steps = int(target_total_flops / standard_flops)
     moe_steps = int(target_total_flops / moe_flops)
     
