@@ -906,7 +906,7 @@ if __name__ == "__main__":
             n_layers=6,
             d_ff=1536,
             batch_size=24,
-            max_steps=1500,
+            max_steps=5000,
             vocab_size=vocab_size,
 
             # MoE specific
