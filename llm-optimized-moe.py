@@ -948,7 +948,7 @@ if __name__ == "__main__":
             n_layers=6,
             d_ff=1536,
             batch_size=24,
-            max_steps=600,
+            max_steps=2000,
             eval_every=10000000,
             vocab_size=vocab_size,
 
