@@ -9,7 +9,7 @@
 
 **🔍 Looking for bugs and improvements in the MoE implementation!** Please review the code and suggest fixes or enhancements.
 
-This repository implements and compares two transformer architectures for language modeling. The `llm-same-flops-data.py` file contains both standard Feed-Forward (FF) and Mixture of Experts (MoE) implementations with **fair FLOP-based comparison**.
+This repository implements and compares two transformer architectures for language modeling.
 
 ## 📊 Latest Results Summary (Fair FLOP Comparison)
 ##### Model is small, so regular FF works better (any ideas on making MoE better?)
